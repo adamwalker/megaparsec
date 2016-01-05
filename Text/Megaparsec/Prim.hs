@@ -20,6 +20,8 @@ module Text.Megaparsec.Prim
   , StorableStream (..)
   , Parsec
   , ParsecT
+  , recover
+  , recoverNoBacktrack
     -- * Primitive combinators
   , MonadParsec (..)
   , (<?>)
@@ -140,8 +142,17 @@ toHints err = Hints hints
 -- Note that if resulting continuation gets 'ParseError' where all messages
 -- are created with 'Message' constructor, hints are ignored.
 
-withHints :: Hints -> (ParseError -> m b) -> ParseError -> m b
-withHints (Hints xs) c e =
+withHints :: Hints -> (State s -> ParseError -> m b) -> State s -> ParseError -> m b
+withHints (Hints xs) c s e =
+  let isMessage (Message _) = True
+      isMessage _           = False
+  in (if all isMessage (errorMessages e)
+      then (c s)
+      else (c s) . addErrorMessages (Expected <$> concat xs))
+     e
+
+withHints' :: Hints -> (ParseError -> m b) -> ParseError -> m b
+withHints' (Hints xs) c e =
   let isMessage (Message _) = True
       isMessage _           = False
   in (if all isMessage (errorMessages e)
@@ -258,7 +269,7 @@ type Parsec s = ParsecT s Identity
 newtype ParsecT s m a = ParsecT
   { unParser :: forall b. State s
              -> (a -> State s -> Hints -> m b) -- consumed-OK
-             -> (ParseError -> m b)            -- consumed-error
+             -> (State s -> ParseError -> m b) -- consumed-error
              -> (a -> State s -> Hints -> m b) -- empty-OK
              -> (ParseError -> m b)            -- empty-error
              -> m b }
@@ -281,6 +292,31 @@ instance A.Alternative (ParsecT s m) where
   empty  = mzero
   (<|>)  = mplus
   many p = reverse <$> manyAcc p
+
+recover :: ParsecT s m a -> (ParseError -> ParsecT s m a) -> ParsecT s m a
+recover m n = ParsecT $ \s cok cerr eok eerr ->
+  let meerr err =
+        let ncerr   s' err' = cerr s' (err' <> err)
+            neok x s' hs = eok x s' (toHints err <> hs)
+            neerr   err' = eerr (err' <> err)
+        in unParser (n err) s cok ncerr neok neerr
+  in unParser m s cok cerr eok meerr
+{-# INLINE recover #-}
+
+recoverNoBacktrack :: ParsecT s m a -> (ParseError -> ParsecT s m a) -> ParsecT s m a
+recoverNoBacktrack m n = ParsecT $ \s cok cerr eok eerr ->
+  let meerr err =
+        let ncerr   s' err' = cerr s' (err' <> err)
+            neok x s' hs = eok x s' (toHints err <> hs)
+            neerr   err' = eerr (err' <> err)
+        in unParser (n err) s cok ncerr neok neerr
+      mcerr ss err =
+        let ncerr   s' err' = cerr s' (err' <> err)
+            neok x s' hs = eok x s' (toHints err <> hs)
+            neerr   err' = eerr (err' <> err)
+        in unParser (n err) ss cok ncerr neok neerr
+  in unParser m s cok mcerr eok meerr
+{-# INLINE recoverNoBacktrack #-}
 
 manyAcc :: ParsecT s m a -> ParsecT s m [a]
 manyAcc p = ParsecT $ \s cok cerr eok _ ->
@@ -310,9 +346,9 @@ pPure x = ParsecT $ \s _ _ eok _ -> eok x s mempty
 pBind :: ParsecT s m a -> (a -> ParsecT s m b) -> ParsecT s m b
 pBind m k = ParsecT $ \s cok cerr eok eerr ->
   let mcok x s' hs = unParser (k x) s' cok cerr
-                     (accHints hs cok) (withHints hs cerr)
+                     (accHints hs cok) ((withHints hs cerr) s')
       meok x s' hs = unParser (k x) s' cok cerr
-                     (accHints hs eok) (withHints hs eerr)
+                     (accHints hs eok) (withHints' hs eerr)
   in unParser m s mcok cerr meok eerr
 {-# INLINE pBind #-}
 
@@ -330,7 +366,7 @@ mkPT k = ParsecT $ \s cok cerr eok eerr -> do
     Consumed ->
       case result of
         OK    x -> cok x s' mempty
-        Error e -> cerr e
+        Error e -> cerr s' e
     Virgin ->
       case result of
         OK    x -> eok x s' mempty
@@ -369,7 +405,7 @@ pZero = ParsecT $ \(State _ pos _) _ _ _ eerr -> eerr $ newErrorUnknown pos
 pPlus :: ParsecT s m a -> ParsecT s m a -> ParsecT s m a
 pPlus m n = ParsecT $ \s cok cerr eok eerr ->
   let meerr err =
-        let ncerr   err' = cerr (err' <> err)
+        let ncerr s err' = cerr s (err' <> err)
             neok x s' hs = eok x s' (toHints err <> hs)
             neerr   err' = eerr (err' <> err)
         in unParser n s cok ncerr neok neerr
@@ -523,11 +559,11 @@ pLabel l p = ParsecT $ \s cok cerr eok eerr ->
   let l' = if null l then l else "rest of " ++ l
       cok' x s' hs = cok x s' $ refreshLastHint hs l'
       eok' x s' hs = eok x s' $ refreshLastHint hs l
-      eerr'    err = eerr $ setErrorMessage (Expected l) err
+      eerr' err    = eerr $ setErrorMessage (Expected l) err
   in unParser p s cok' cerr eok' eerr'
 
 pTry :: ParsecT s m a -> ParsecT s m a
-pTry p = ParsecT $ \s cok _ eok eerr -> unParser p s cok eerr eok eerr
+pTry p = ParsecT $ \s cok _ eok eerr -> unParser p s cok (const eerr) eok eerr
 {-# INLINE pTry #-}
 
 pLookAhead :: ParsecT s m a -> ParsecT s m a
@@ -540,7 +576,7 @@ pNotFollowedBy :: Stream s t => ParsecT s m a -> ParsecT s m ()
 pNotFollowedBy p = ParsecT $ \s@(State input pos _) _ _ eok eerr ->
   let l = maybe eoi (showToken . fst) (uncons input)
       cok' _ _ _ = eerr $ unexpectedErr l pos
-      cerr'    _ = eok () s mempty
+      cerr'  _ _ = eok () s mempty
       eok' _ _ _ = eerr $ unexpectedErr l pos
       eerr'    _ = eok () s mempty
   in unParser p s cok' cerr' eok' eerr'
@@ -556,7 +592,7 @@ pToken :: Stream s t
        => (Int -> SourcePos -> t -> SourcePos)
        -> (t -> Either [Message] a)
        -> ParsecT s m a
-pToken nextpos test = ParsecT $ \(State input pos w) cok _ _ eerr ->
+pToken nextpos test = ParsecT $ \s@(State input pos w) cok _ _ eerr ->
     case uncons input of
       Nothing     -> eerr $ unexpectedErr eoi pos
       Just (c,cs) ->
@@ -573,14 +609,14 @@ pTokens :: Stream s t
         -> [t]
         -> ParsecT s m [t]
 pTokens _ _ [] = ParsecT $ \s _ _ eok _ -> eok [] s mempty
-pTokens nextpos test tts = ParsecT $ \(State input pos w) cok cerr _ eerr ->
+pTokens nextpos test tts = ParsecT $ \s@(State input pos w) cok cerr _ eerr ->
   let errExpect x = setErrorMessage (Expected $ showToken tts)
                     (newErrorMessage (Unexpected x) pos)
       walk [] is rs = let pos' = nextpos w pos tts
                           s'   = State rs pos' w
                       in cok (reverse is) s' mempty
       walk (t:ts) is rs =
-        let errorCont = if null is then eerr else cerr
+        let errorCont = if null is then eerr else cerr s
             what      = if null is then eoi  else showToken $ reverse is
         in case uncons rs of
              Nothing -> errorCont . errExpect $ what
@@ -779,7 +815,7 @@ runParsecT :: Monad m
            -> m (Reply s a)
 runParsecT p s = unParser p s cok cerr eok eerr
   where cok a s' _ = return $ Reply s' Consumed (OK a)
-        cerr err   = return $ Reply s  Consumed (Error err)
+        cerr _ err = return $ Reply s  Consumed (Error err)
         eok a s' _ = return $ Reply s' Virgin   (OK a)
         eerr err   = return $ Reply s  Virgin   (Error err)
 
